@@ -1,102 +1,135 @@
 import cv2
-from random import randrange as r
+import dlib
+import time
 import serial
 import serial.tools.list_ports
-import time
 
+# Function to auto-detect Arduino port
+'''
 def find_arduino_port():
-    """Automatically detect Arduino serial port."""
-    arduino_ports = []
-    for port in serial.tools.list_ports.comports():
-        if 'Arduino' in port.description or 'CH340' in port.description or 'USB Serial' in port.description:
-            arduino_ports.append(port.device)
-        if port.vid in [0x2341, 0x0403, 0x1A86]:
-            arduino_ports.append(port.device)
+    ports = serial.tools.list_ports.comports()
+    for port in ports:
+        try:
+            # Attempt to open the port
+            ser = serial.Serial(port.device, 9600, timeout=1)
+            time.sleep(2)  # Wait for connection to stabilize
+            ser.write(b'0')  # Send a test byte to check if Arduino responds
+            ser.close()  # Close the test connection
+            return port.device  # Return the valid port
+        except (serial.SerialException, OSError):
+            continue
+    return None
 
-    if not arduino_ports:
-        print("No Arduino detected. Continuing without serial communication.")
-        return None
-    if len(arduino_ports) > 1:
-        print(f"Multiple Arduino ports found: {arduino_ports}. Using the first one.")
-
-    return arduino_ports[0]
-
-# Initialize serial communication
-ser = None
+# Initialize serial communication with Arduino
 port = find_arduino_port()
-if port:
-    try:
-        ser = serial.Serial(port, 9600, timeout=1)
-        time.sleep(2)
-        print(f"Connected to Arduino on {port}")
-    except serial.SerialException as e:
-        print(f"Failed to connect to {port}: {e}")
-        ser = None
-else:
-    print("No serial connection established.")
+if port is None:
+    print("Error: Could not find an Arduino. Please check the connection.")
+    exit()
+try:
+    ser = serial.Serial(port, 9600, timeout=1)
+    time.sleep(2)  # Wait for the serial connection to initialize
+except serial.SerialException as e:
+    print(f"Error opening serial port {port}: {e}")
+    exit()
+    '''
 
-# Load Haar cascades
-face_cascade = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
-eye_cascade = cv2.CascadeClassifier("haarcascade_eye.xml")
+# Load face detector and facial landmark predictor
+face_detector = dlib.get_frontal_face_detector()
+landmark_predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
 
-if face_cascade.empty() or eye_cascade.empty():
-    print("Error loading cascades")
-    if ser:
-        ser.close()
-    exit(1)
+# Function to calculate eye aspect ratio
+def eye_aspect_ratio(eye_points):
+    vertical_1 = ((eye_points[1].x - eye_points[5].x) ** 2 + (eye_points[1].y - eye_points[5].y) ** 2) ** 0.5
+    vertical_2 = ((eye_points[2].x - eye_points[4].x) ** 2 + (eye_points[2].y - eye_points[4].y) ** 2) ** 0.5
+    horizontal = ((eye_points[0].x - eye_points[3].x) ** 2 + (eye_points[0].y - eye_points[3].y) ** 2) ** 0.5
+    ear = (vertical_1 + vertical_2) / (2.0 * horizontal)
+    return ear
 
-# Start webcam
-webcam = cv2.VideoCapture(0)
-if not webcam.isOpened():
-    print("Webcam error")
-    if ser:
-        ser.close()
-    exit(1)
+# Function to detect closed eyes
+def detect_closed_eyes(frame, landmarks):
+    left_eye_points = [landmarks.part(i) for i in range(36, 42)]
+    right_eye_points = [landmarks.part(i) for i in range(42, 48)]
+    left_ear = eye_aspect_ratio(left_eye_points)
+    right_ear = eye_aspect_ratio(right_eye_points)
+    ear = (left_ear + right_ear) / 2.0
+    for i in range(36, 48):
+        cv2.circle(frame, (landmarks.part(i).x, landmarks.part(i).y), 2, (255, 255, 255), -1)
+    return ear
 
+# Function to detect yawning
+def detect_yawn(frame, landmarks):
+    mouth_points = [landmarks.part(i) for i in range(48, 68)]
+    if len(mouth_points) == 20:
+        mouth_width = abs(mouth_points[6].x - mouth_points[0].x)
+        mouth_height = abs(mouth_points[3].y - mouth_points[9].y)
+        aspect_ratio = mouth_height / mouth_width if mouth_width != 0 else 0
+        for i in range(20):
+            cv2.circle(frame, (mouth_points[i].x, mouth_points[i].y), 2, (255, 255, 255), 2)
+            cv2.line(frame, (mouth_points[i].x, mouth_points[i].y), (mouth_points[(i+1)%20].x, mouth_points[(i+1)%20].y), (255, 255, 255), 2)
+        return aspect_ratio
+    return None
+
+# Open video capture for webcam
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Error: Could not open webcam.")
+    ser.close()
+    exit()
+
+# Set the window size
+cv2.namedWindow('Drowsiness and Yawn Detection', cv2.WINDOW_NORMAL)
+cv2.resizeWindow('Drowsiness and Yawn Detection', 800, 700)
+
+# Initialize variables for eye detection
+closed_eye_start = None
+closed_eye_alert_threshold = 0.5
+eye_closed_count = 0
+yawn_count = 0
+
+# Process webcam frames until the user exits
 while True:
-    success, frame = webcam.read()
-    if not success:
-        print("Error reading webcam")
+    ret, frame = cap.read()
+    if not ret:
+        print("Error: Could not read frame from webcam.")
         break
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
-    eyes_open = False
+    faces = face_detector(gray)
 
-    for (x, y, w, h) in faces:
-        cv2.rectangle(frame, (x, y), (x+w, y+h), (r(0,256), r(0,256), r(0,256)), 2)
-        roi_gray = gray[y:y+h, x:x+w]
-        roi_color = frame[y:y+h, x:x+w]
-        eyes = eye_cascade.detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=10)
-        if len(eyes) > 0:
-            eyes_open = True
-            for (ex, ey, ew, eh) in eyes:
-                cv2.rectangle(roi_color, (ex, ey), (ex+ew, ey+eh), (0, 255, 0), 2)
+    for face in faces:
+        landmarks = landmark_predictor(gray, face)
+        ear = detect_closed_eyes(frame, landmarks)
+        ear_threshold = 0.25
+        if ear < ear_threshold:
+            if closed_eye_start is None:
+                closed_eye_start = time.time()
+            else:
+                closed_eye_duration = time.time() - closed_eye_start
+                if closed_eye_duration >= closed_eye_alert_threshold:
+                    cv2.putText(frame, "Drowsiness Detected", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                    eye_closed_count += 1
+                    '''
+                    # Send '1' to Arduino
+                    try:
+                        ser.write(b'1')
+                    except serial.SerialException as e:
+                        print(f"Error writing to serial port: {e}")'''
+        else:
+            closed_eye_start = None
 
-    # Debug print
-    print("Sending:", int(eyes_open))
+        aspect_ratio = detect_yawn(frame, landmarks)
+        if aspect_ratio is not None:
+            yawn_threshold = 1.5
+            if aspect_ratio > yawn_threshold:
+                cv2.putText(frame, "Yawn Detected", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                yawn_count += 1
 
-    # Send signal to Arduino
-    if ser:
-        try:
-            ser.write(f"{int(eyes_open)}\n".encode())  # include newline
-        except serial.SerialException as e:
-            print(f"Serial write failed: {e}")
+    cv2.imshow('Drowsiness and Yawn Detection', frame)
 
-    # Show video
-    cv2.imshow('Eye Detector', frame)
-
-    # Press 's' or 'S' to exit
-    key = cv2.waitKey(1)
-    if key in [ord('s'), ord('S')]:
+    if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# Cleanup
-webcam.release()
+# Release resources
+cap.release()
+ser.close()
 cv2.destroyAllWindows()
-if ser:
-    try:
-        ser.close()
-    except serial.SerialException:
-        pass
-
